@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: 'lms'
 
 Parameters:
-  InstanceType:
+  MoodleInstanceType:
     Type: String
     Default: t4g.small
     AllowedValues:
@@ -11,7 +11,17 @@ Parameters:
       - t4g.small
       - t4g.medium
       - t4g.large
-    Description: EC2 instance type (Arm-based Graviton2) for ECU
+    Description: EC2 instance type (Arm-based Graviton2) for Moodle
+  CodeServerInstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.nano
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+    Description: EC2 instance type (Arm-based Graviton2) for CodeServer
   CustomDomainName:
     Type: String
     Description: Custom Domain Name for CloudFront (set after first deployment)
@@ -44,6 +54,24 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+
+  DynamoDBGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -66,11 +94,22 @@ Resources:
         - Key: Name
           Value: !Sub ${AWS::StackName}-PublicSubnet2
 
-  PrivateSubnet1:
+  PublicSubnet3:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PublicSubnet3
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
         - Key: Name
@@ -80,11 +119,21 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.3.0/24
+      CidrBlock: 10.0.4.0/24
       AvailabilityZone: !Select [1, !GetAZs '']
       Tags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-PrivateSubnet2
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.5.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PrivateSubnet3
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -114,7 +163,32 @@ Resources:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  EC2InstanceRole:
+  PublicSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      RouteTableId: !Ref PublicRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instance
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-SecurityGroup
+
+  EC2SecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      GroupId: !GetAtt EC2SecurityGroup.GroupId
+      # SourceSecurityGroupId: CloudFront-VPCOrigins-Service-SG
+      SourcePrefixListId: pl-58a04531
+
+  MoodleEC2InstanceRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -136,34 +210,121 @@ Resources:
                 Resource: '*'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
 
-  EC2InstanceProfile:
+  MoodleEC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
-        - !Ref EC2InstanceRole
+        - !Ref MoodleEC2InstanceRole
 
-  EC2SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+  MoodleEC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT30M
     Properties:
-      GroupDescription: Security group for EC2 instance
-      VpcId: !Ref VPC
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: !Ref MoodleInstanceType
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref MoodleEC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            DeleteOnTermination: false
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false  
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          MOUNT_POINT="/var/www/moodledata"
+          dnf install -y git wget unzip tar
+          dnf install -y httpd
+          systemctl enable --now httpd          
+          dnf install amazon-cloudwatch-agent -y
+          cat << EOF > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    { "file_path": "/var/log/messages", "log_group_name": "${AWS::StackName}-moodle-system" },
+                    { "file_path": "/var/log/httpd/error_log", "log_group_name": "${AWS::StackName}-moodle-httpd" }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          mkdir -p $MOUNT_POINT
+          if ! blkid /dev/sdb; then
+            mkfs -t xfs /dev/sdb
+          fi
+          UUID=$(blkid -s UUID -o value /dev/sdb)
+          echo "UUID=$UUID $MOUNT_POINT xfs defaults,nofail 0 2" >> /etc/fstab
+          mount -a
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource MoodleEC2Instance --region ${AWS::Region}
       Tags:
         - Key: Name
-          Value: !Sub ${AWS::StackName}-SecurityGroup
+          Value: moodle
 
-  EC2SecurityGroupIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    DependsOn: LMSVPCOrigin
+  MoodleSystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain    
     Properties:
-      IpProtocol: tcp
-      FromPort: 80
-      ToPort: 80
-      GroupId: !GetAtt EC2SecurityGroup.GroupId
-      # SourceSecurityGroupId: CloudFront-VPCOrigins-Service-SG
-      SourcePrefixListId: pl-58a04531
+      LogGroupName: !Sub "${AWS::StackName}-moodle-system"
+      RetentionInDays: 7
 
-  EC2Instance:
+  MoodleHttpLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain    
+    Properties:
+      LogGroupName: !Sub "${AWS::StackName}-moodle-httpd"
+      RetentionInDays: 7
+
+  CodeServerEC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SharedBucketAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  CodeServerEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref CodeServerEC2InstanceRole
+
+  CodeServerEC2Instance:
     Type: AWS::EC2::Instance
     CreationPolicy:
       ResourceSignal:
@@ -171,52 +332,99 @@ Resources:
         Timeout: PT30M    
     Properties:
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref CodeServerInstanceType
       SubnetId: !Ref PublicSubnet1
       SecurityGroupIds:
         - !Ref EC2SecurityGroup
-      IamInstanceProfile: !Ref EC2InstanceProfile
+      IamInstanceProfile: !Ref CodeServerEC2InstanceProfile
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: 24
+            VolumeSize: 8
+            VolumeType: gp3
             DeleteOnTermination: false
-            VolumeType: gp3 
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
+          MOUNT_POINT="/opt/vscode"
           dnf update -y
-          #dnf install -y mariadb105-server
-          #systemctl enable --now mariadb
-          #dnf install -y php8.2 php8.2-fpm php8.2-mysqli php8.2-gd php8.2-intl php8.2-mbstring php8.2-xml php8.2-opcache php8.2-soap php8.2-zip php8.2-bcmath
-          #systemctl enable --now php-fpm
-          #dnf install -y httpd
-          #systemctl enable --now httpd
-          #dnf install -y git wget unzip tar
-          #cd /var/www/html
-          #git clone -b MOODLE_405_STABLE git://git.moodle.org/moodle.git
-          #chown -R nginx:nginx /var/www/html/moodle
-          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+          dnf install -y git wget unzip tar
+          dnf install -y httpd
+          systemctl enable --now httpd          
+          dnf install amazon-cloudwatch-agent -y
+          cat << EOF > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    { "file_path": "/var/log/messages", "log_group_name": "${AWS::StackName}-codeserver-system" },
+                    { "file_path": "/var/log/httpd/error_log", "log_group_name": "${AWS::StackName}-codeserver-httpd" }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          mkdir -p $MOUNT_POINT
+          if ! blkid /dev/sdb; then
+            mkfs -t xfs /dev/sdb
+          fi
+          UUID=$(blkid -s UUID -o value /dev/sdb)
+          echo "UUID=$UUID $MOUNT_POINT xfs defaults,nofail 0 2" >> /etc/fstab
+          mount -a
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource CodeServerEC2Instance --region ${AWS::Region}
       Tags:
         - Key: Name
-          Value: moodle
+          Value: 'code-server'
 
-  LMSVPCOrigin:
+  CodeServerSystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain    
+    Properties:
+      LogGroupName: !Sub "${AWS::StackName}-codeserver-system"
+      RetentionInDays: 7
+
+  CodeServerHttpLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain    
+    Properties:
+      LogGroupName: !Sub "${AWS::StackName}-codeserver-httpd"
+      RetentionInDays: 7
+
+  MoodleVPCOrigin:
     Type: AWS::CloudFront::VpcOrigin
-    DependsOn: EC2Instance
+    DependsOn: MoodleEC2Instance
     Properties:
       VpcOriginEndpointConfig:
-        Name: !Sub '${AWS::StackName}'
-        Arn: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${EC2Instance}'
+        Name: !Sub '${AWS::StackName}-moodle'
+        Arn: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${MoodleEC2Instance}'
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: 'http-only'
+
+  CodeServerVPCOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    DependsOn: CodeServerEC2Instance
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub '${AWS::StackName}-codeserver'
+        Arn: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${CodeServerEC2Instance}'
         HTTPPort: 80
         HTTPSPort: 443
         OriginProtocolPolicy: 'http-only'
 
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
-    DependsOn:
-      - EC2Instance
-      - LMSVPCOrigin
     Properties:
       DistributionConfig:
         Aliases:
@@ -225,14 +433,35 @@ Resources:
           AcmCertificateArn: !Ref CertificateArn
           SslSupportMethod: sni-only      
         Enabled: true
-        Comment: !Sub "lms (${AWS::StackName})"
+        Comment: !Sub "${AWS::StackName}"
         Origins:
-          - Id: VpcOrigin
-            DomainName: !GetAtt EC2Instance.PrivateDnsName
+          - Id: MoodleVpcOrigin
+            DomainName: !GetAtt MoodleEC2Instance.PrivateDnsName
             VpcOriginConfig:
-              VpcOriginId: !GetAtt LMSVPCOrigin.Id
+              VpcOriginId: !GetAtt MoodleVPCOrigin.Id
+          - Id: CodeServerVpcOrigin
+            DomainName: !GetAtt CodeServerEC2Instance.PrivateDnsName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt CodeServerVPCOrigin.Id
+        CacheBehaviors:
+          - PathPattern: '/moodle*'
+            TargetOriginId: MoodleVpcOrigin
+            ViewerProtocolPolicy: 'https-only'
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3              
         DefaultCacheBehavior:
-          TargetOriginId: VpcOrigin
+          TargetOriginId: CodeServerVpcOrigin
           ViewerProtocolPolicy: 'https-only'
           AllowedMethods:
             - GET
@@ -247,3 +476,16 @@ Resources:
             - HEAD
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
           OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+
+  StateManagerAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunShellScript
+      Targets:
+        - Key: 'tag:Name'
+          Values:
+            - 'moodle'
+      Parameters:
+        commands:
+          - /usr/bin/php /var/www/html/moodle/admin/cli/cron.php
+      ScheduleExpression: "rate(30 minutes)"
